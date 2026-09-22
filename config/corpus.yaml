@@ -1,0 +1,189 @@
+# ---------------------------------------------------------------------------
+# Corpus definition for the Somalia Situation Report RAG assistant.
+#
+# This file is the single source of truth for WHAT is in the index. Every
+# downstream artefact (raw JSONL, PDF cache, chunk parquet, eval set) is
+# reproducible from this file plus a ReliefWeb appname. Change it, re-run,
+# get a new corpus — no hidden state in scripts.
+# ---------------------------------------------------------------------------
+
+corpus:
+  name: somalia-sitreps
+  version: "1.0"
+
+  # --- ReliefWeb selection -------------------------------------------------
+  # country vs primary_country matters here. Regional products ("Horn of
+  # Africa Drought Response") tag Somalia under `country` but carry a
+  # different `primary_country`. We cast the wide net at ingest and keep
+  # `is_primary_country` as retrieval-time metadata, so the corpus can be
+  # narrowed later without re-fetching.
+  filters:
+    country_iso3: SOM
+    formats:
+      - Situation Report
+    language_code: en
+    status: published
+    date_from: "2018-01-01"
+
+    # Restricting to three publishers buys structural consistency: these
+    # three use stable templates, so section detection and sector tagging
+    # land far more reliably than across the long tail of NGO reporting.
+    #
+    # The cost, stated plainly so it is a choice and not an accident:
+    # displacement figures in Somalia largely originate with IOM DTM and
+    # the UNHCR-led PRMN. Keeping UNHCR retains much of that, but dropping
+    # IOM removes the flow-monitoring series, and dropping FSNAU removes
+    # the IPC/nutrition analysis that food-security questions resolve to.
+    # Run `python -m src.ingest sources` before committing — one API call
+    # shows the real document counts per publisher.
+    #
+    # Matched on source.shortname, which is exact. Verify the spellings
+    # with the `sources` command rather than trusting this list.
+    source_field: source.shortname
+    sources:
+      - OCHA
+      - UNHCR
+      - WHO
+    # Candidates to reconsider after the first profile:
+    #   - IOM        displacement tracking (DTM), flow monitoring
+    #   - FSNAU      food security + nutrition analysis
+    #   - UNICEF     child protection, WASH, nutrition response
+    #   - WFP        food assistance reach
+
+  # Date window, on date.original (date the SOURCE published it), not
+  # date.created (date ReliefWeb ingested it). These differ by days to
+  # weeks and date.original is what a user means by "the March report".
+  date_field: date.original
+  date_from: "2018-01-01"
+  date_to: null # null = today at run time
+
+  # Pagination is sliced by calendar window rather than deep offsets.
+  # Elasticsearch-backed APIs typically refuse offsets past ~10k, and a
+  # year of Somalia sitreps sits comfortably under the 1000-row page cap.
+  slice_interval: year
+
+  # --- Fields to request ---------------------------------------------------
+  # Explicit include list, not `preset=full`. Halves the payload and makes
+  # the schema contract visible in code review.
+  fields:
+    - id
+    - title
+    - body
+    - url
+    - url_alias
+    - origin
+    - status
+    - date.original
+    - date.created
+    - date.changed
+    - source.name
+    - source.shortname
+    - source.type.name
+    - primary_country.iso3
+    - primary_country.name
+    - country.iso3
+    - country.name
+    - format.name
+    - theme.name
+    - disaster.name
+    - disaster.glide
+    - disaster_type.name
+    - ocha_product.name
+    - language.code
+    - file.id
+    - file.url
+    - file.filename
+    - file.mimetype
+    - file.description
+
+# --- Text resolution -------------------------------------------------------
+# ReliefWeb's `body` field is sometimes the whole report and sometimes a
+# two-line teaser above a PDF link. Indexing `body` blindly gives you a
+# corpus of abstracts and a retriever that cannot answer anything specific.
+extraction:
+  # Below this many characters, `body` is treated as a teaser and we go to
+  # the PDF. Tuned by inspecting the char-length histogram — see
+  # notebooks/01_corpus_profile.ipynb.
+  body_min_chars: 2500
+
+  # A body is used only when it is long AND carries its own sections.
+  # Length alone was the wrong test: the profile showed body-sourced text
+  # at 1% structured against 96% for PDFs, and OCHA — which posts long
+  # bodies — at a median of one section per document. ReliefWeb's body is a
+  # prose rendering with the headings flattened; the PDF is the document as
+  # its publisher laid it out.
+  prefer_structured: true
+  min_body_sections: 3
+  # Set true to concatenate body and PDF instead of choosing one.
+  merge_body_and_pdf: false
+
+  pdf:
+    enabled: true
+    # ReliefWeb tags a report with every country it mentions, so UNHCR's
+    # global fact sheets (Yemen, Ukraine, DRC, Libya) land in a Somalia
+    # query because they count Somali refugees. They are not Somalia
+    # situation reports. `primary_country` is the editorial judgement of
+    # what a report is actually about — filter on it here rather than
+    # spending download time and index space on the rest. The flag is kept
+    # per-document as is_primary_country_som, so widening later needs no
+    # refetch.
+    primary_country_only: true
+    max_mb: 40 # skip pathological scans
+    max_pages: 40 # sitreps run 2-15 pages; caps the 200-page annex compilations
+    # layout = ML layout model, better headings, slower (proven on real WHO PDFs)
+    # legacy = font-size headings, ~5x faster, untested on real PDFs
+    # OCR is always off: sitreps are born-digital and OCR reads map labels
+    # into the text, which corrupts region tagging.
+    engine: layout
+    accept_mimetypes: ["application/pdf"]
+    # Attachment descriptions like "Annex B - Contact list" are noise.
+    skip_filename_patterns:
+      - "(?i)annex"
+      - "(?i)contact[ _-]?list"
+      - "(?i)4?w[ _-]?matrix"
+    # Politeness. Attachments are served from reliefweb.int, not the API
+    # host, but there is no reason to hammer either.
+    requests_per_second: 2.0
+
+# --- Chunking --------------------------------------------------------------
+chunking:
+  # Budget is TOTAL tokens including the prepended context header, measured
+  # with the embedding model's own tokenizer. bge-small-en-v1.5 truncates
+  # silently at 512 — a chunk of 700 tokens loses its tail with no warning
+  # and no error. This is the most common invisible bug in RAG pipelines.
+  embedding_model: BAAI/bge-small-en-v1.5
+  max_tokens: 512
+  header_reserve: 60
+  target_tokens: 400 # body text target, leaves room for header + overlap
+  overlap_tokens: 64
+  min_tokens: 48 # drop fragments smaller than this
+
+  # Never split a Markdown table across chunks. A half-table is worse than
+  # no table: it reads as complete and the numbers are wrong.
+  # Tables are never split mid-row. A table too large for one chunk is split
+  # at row boundaries with its header repeated in each piece, so every row
+  # keeps the column labels that give its numbers meaning. Emitting oversized
+  # tables whole was worse: the embedding model truncates at its window
+  # silently, so the tail was never embedded at all.
+  atomic_tables: true
+
+  # Small-to-big: embed the child chunk, hand the parent section to the LLM.
+  emit_parent_sections: true
+
+dedup:
+  # Sitreps are serial. Boilerplate ("About OCHA", methodology notes,
+  # funding-appeal language) repeats verbatim across every edition. Without
+  # this, a top-5 retrieval returns five copies of the same disclaimer.
+  exact_hash: true              # drops repeats WITHIN one document only
+  boilerplate_doc_threshold: 5  # same text in >=5 distinct docs...
+  boilerplate_requires_no_figures: true  # ...AND carrying no figures
+  drop_boilerplate: true
+  # Identical text across editions is NOT dropped — it is tagged with a
+  # shared content_group and collapsed in the result set instead, so every
+  # edition stays addressable by date. See chunker.mark_duplicates.
+
+paths:
+  raw: data/raw
+  interim: data/interim
+  processed: data/processed
+  pdf_cache: data/raw/pdf

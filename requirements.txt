@@ -1,0 +1,21 @@
+# --- ingestion ---
+requests>=2.32
+PyYAML>=6.0
+pymupdf4llm>=0.0.17      # PDF -> Markdown, preserves headings + tables (AGPL-3.0)
+
+# --- chunking / embedding ---
+transformers>=4.44       # tokenizer only, for exact chunk sizing
+sentence-transformers>=3.0
+# BAAI/bge-small-en-v1.5 : 512-token limit, 384 dims, CPU-friendly on HF free tier
+
+# --- generation (pick one; both are optional, lazily imported) ---
+# openai>=1.40            # also covers Groq / Together / OpenRouter / local vLLM
+# anthropic>=0.40
+
+# --- next ---
+# chromadb>=0.5          # vector store
+# ragas>=0.2             # evaluation harness
+# gradio>=4.44           # Space UI
+
+# --- dev ---
+pytest>=8.0
